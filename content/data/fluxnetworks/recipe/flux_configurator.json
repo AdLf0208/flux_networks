@@ -1,0 +1,18 @@
+{
+  "category": "misc",
+  "key": {
+    "e": "minecraft:ender_eye",
+    "f": "fluxnetworks:flux_dust",
+    "o": "minecraft:obsidian"
+  },
+  "pattern": [
+    " fe",
+    " of",
+    "o  "
+  ],
+  "result": {
+    "count": 1,
+    "id": "fluxnetworks:flux_configurator"
+  },
+  "type": "minecraft:crafting_shaped"
+}

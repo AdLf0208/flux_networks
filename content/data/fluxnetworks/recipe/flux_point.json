@@ -1,0 +1,17 @@
+{
+  "category": "misc",
+  "key": {
+    "b": "minecraft:redstone_block",
+    "c": "fluxnetworks:flux_core"
+  },
+  "pattern": [
+    " c ",
+    "cbc",
+    " c "
+  ],
+  "result": {
+    "count": 1,
+    "id": "fluxnetworks:flux_point"
+  },
+  "type": "minecraft:crafting_shaped"
+}

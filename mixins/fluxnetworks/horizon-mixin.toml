@@ -1,0 +1,138 @@
+[mod]
+id = "fluxnetworks"
+version = "0.1.0"
+priority = 100
+
+[compatibility]
+horizon_revision = "1d63e0a5a37a7a708eb0b32b49bf0dfeb28ed8a9"
+
+# The pure network rules (standalone crate lib, injected as
+# `crate::game::fluxnetworks`).
+[[module]]
+id = "runtime"
+file = "crates/horizon-client/src/game.rs"
+name = "fluxnetworks"
+source = "runtime.rs"
+
+# Game-side glue: block entities, energy buffers, the network pass, the command.
+[[module]]
+id = "state"
+file = "crates/horizon-client/src/game.rs"
+name = "fluxnetworks_state"
+source = "support.rs"
+
+# The one file a player installs: the bundle carries its own content mod
+# (`mixins/fluxnetworks/data/fluxnetworks-content.hmod`) and appends it to the
+# dev-mod list, so one `.hnmod` installs the seven blocks, the four items and the
+# code. The registry keeps one file per project, so a split port could not be
+# listed; AE2 ships the same pattern.
+[[injection]]
+id = "embedded-content"
+kind = "HEAD"
+cancellable = true
+target = "horizon_client::game::mods::content_root"
+helper = "embedded_content.rs"
+bindings = [
+  { name = "root", ty = "&std::path::Path", value = "root" },
+  { name = "enabled", ty = "&std::collections::BTreeSet<String>", value = "enabled" },
+  { name = "dev", ty = "&[std::path::PathBuf]", value = "dev" },
+]
+
+# The five devices have a block entity (API 15).
+[[injection]]
+id = "block-entity"
+hook = "block_entity"
+hook_version = 1
+kind = "HEAD"
+helper = "block_entity.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "entity", ty = "&mut Option<(String, horizon_world::nbt::Compound)>", value = "entity" },
+]
+
+# ... and tick (API 15).
+[[injection]]
+id = "block-entity-ticks"
+hook = "block_entity_ticks"
+hook_version = 1
+kind = "HEAD"
+helper = "ticks.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "ticks", ty = "&mut bool", value = "ticks" },
+]
+
+# Each device's FE buffer is a real Capabilities.Energy.BLOCK buffer (API 142).
+[[injection]]
+id = "block-entity-energy"
+hook = "block_entity_energy"
+hook_version = 1
+kind = "HEAD"
+helper = "energy.rs"
+bindings = [
+  { name = "block", ty = "&str", value = "block" },
+  { name = "energy", ty = "&mut Option<horizon_client::containers::ModEnergyBuffer>", value = "energy" },
+]
+
+# One server tick (API 17): a device queues its position.
+[[injection]]
+id = "block-entity-tick"
+hook = "block_entity_tick"
+hook_version = 1
+kind = "HEAD"
+helper = "tick.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "pos", ty = "[i32; 3]", value = "pos" },
+  { name = "entity", ty = "&mut horizon_client::containers::ModBlockEntity", value = "entity" },
+]
+
+# After the level's tick: one pass runs every network loaded in this level.
+# A block entity is out of the world during its own tick, so the neighbour
+# reads and the `native_move_energy` moves all happen here (API 23).
+[[injection]]
+id = "level-tick-post"
+hook = "level_tick_post"
+hook_version = 1
+kind = "HEAD"
+helper = "level_tick_post.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "dimension", ty = "&str", value = "dimension" },
+]
+
+# `/fluxnetworks info|energy|network|priority` (API 8).
+[[injection]]
+id = "register-commands"
+hook = "register_commands"
+hook_version = 1
+kind = "HEAD"
+helper = "register.rs"
+bindings = [
+  { name = "commands", ty = "&mut Vec<NativeCommand>", value = "commands" },
+]
+
+[[injection]]
+id = "perform-command"
+hook = "perform_command"
+hook_version = 1
+kind = "HEAD"
+helper = "perform.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "player", ty = "&NativeServerPlayer", value = "player" },
+  { name = "command", ty = "&str", value = "command" },
+  { name = "ran", ty = "&mut bool", value = "ran" },
+]
+
+# A world opened or closed: the queued positions are per world.
+[[injection]]
+id = "world-lifecycle"
+hook = "world_lifecycle"
+hook_version = 1
+kind = "HEAD"
+helper = "world.rs"
+bindings = [
+  { name = "game", ty = "&mut crate::game::Game<'_>", value = "&mut *self" },
+  { name = "phase", ty = "WorldPhase", value = "phase" },
+]

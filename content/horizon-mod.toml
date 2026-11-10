@@ -1,0 +1,14 @@
+# Slice 1 of the Flux Networks port: the seven blocks and four items of Flux
+# Networks, with one energy network behind the plug, the point and the three
+# storages. Assets and data are carried from the ATM10 jar
+# (FluxNetworks-1.21.1-8.0.0.jar), with the patches documented in README.md.
+# Licence: MIT (SonarSonic/Flux-Networks); local-only until the maintainer
+# approves publishing.
+id = "fluxnetworks"
+name = "Flux Networks"
+version = "8.0.0"
+description = "Wireless energy networks: one energy network (slice 1)"
+authors = ["Sonar Sonic", "BloCamLimb"]
+api = "0.2"
+side = "both"
+capabilities = ["registries"]

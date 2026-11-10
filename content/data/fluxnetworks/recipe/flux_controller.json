@@ -1,0 +1,18 @@
+{
+  "category": "misc",
+  "key": {
+    "b": "fluxnetworks:flux_block",
+    "c": "fluxnetworks:flux_core",
+    "f": "fluxnetworks:flux_dust"
+  },
+  "pattern": [
+    "bcb",
+    "f f",
+    "bbb"
+  ],
+  "result": {
+    "count": 1,
+    "id": "fluxnetworks:flux_controller"
+  },
+  "type": "minecraft:crafting_shaped"
+}

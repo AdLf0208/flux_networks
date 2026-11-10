@@ -1,0 +1,11 @@
+{
+  "values": [
+    "basic_flux_storage",
+    "flux_block",
+    "flux_controller",
+    "flux_plug",
+    "flux_point",
+    "gargantuan_flux_storage",
+    "herculean_flux_storage"
+  ]
+}
