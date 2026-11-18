@@ -1,0 +1,36 @@
+# Flux Networks for Horizon — one flat SDK package (mod API 0.2).
+#
+# Slice 1: one energy network over five blocks. A plug pulls FE out of the blocks beside it, the
+# network moves it to the points by priority, a point pushes it into the blocks beside it, and the
+# three storages are buffers the network may fill and drain. The seven blocks and the four items
+# are carried from the ATM10 jar (FluxNetworks-1.21.1-8.0.0.jar, MIT).
+# LOCAL-ONLY until the maintainer approves publishing (ARCHITECTURE.md §8).
+id = "fluxnetworks"
+name = "Flux Networks"
+# The port's own version, not the original mod's 8.0.0: a resubmission is always a new version
+# (the retired .hnmod bundle was 0.1.0).
+version = "0.2.0"
+description = """Wireless energy networks: a plug pulls Forge Energy out of the blocks beside it, the network
+moves it to the points by priority, and a point pushes it into the blocks beside it. The three
+storages (2,000,000 / 16,000,000 / 128,000,000 FE) are network buffers a plug and a point can also
+fill and drain. Devices join a network by id; /fluxnetworks info, energy, network and priority set
+one and read a device back. This slice has no configurator GUI, no wireless charging, no network
+security and no connection rendering."""
+authors = ["Sonar Sonic", "BloCamLimb", "Horizon native mod contributors"]
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
+# beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's
+# package name and version are not the mod's.
+api = "0.2"
+# The installation side, not the hook's: the network runs on the server, and single player's
+# integrated server belongs to the client installation, so a LAN host or a single-player world
+# needs both.
+side = "both"
+# The one shared value every manifest carries ("May add blocks, items, mob effects and entity
+# types"). This package declares the seven blocks and their items in data/, and a block entity type
+# and an energy buffer for the five devices.
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

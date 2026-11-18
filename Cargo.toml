@@ -1,0 +1,18 @@
+[package]
+# Port of Flux Networks 8.0.0 (SonarSonic/Flux-Networks, MIT, ATM10's NeoForge 1.21.1 jar). The
+# port targets Horizon 26.3 at the pin in horizon-mod.toml and is a clean-room Rust rewrite from
+# the mod's behaviour (notes.md, FINDINGS.md). Local-only until the maintainer approves publishing.
+#
+# Cargo's name and version are not the mod's identity: horizon-mod.toml is.
+name = "fluxnetworks"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Flux Networks for Horizon: wireless energy networks over five devices"
+publish = false
+
+[dependencies]
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command (the
+# launcher builds against its own copy of the same build). Any other registry dependency must be
+# pinned with `horizon-launcher native-lock .` before building.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }

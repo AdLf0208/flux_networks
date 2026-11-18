@@ -1,0 +1,10 @@
+{
+  "item": true,
+  "properties": {
+    "explosion_resistance": 1000.0,
+    "hardness": 1.0,
+    "requires_tool": true,
+    "sounds": "minecraft:iron_block"
+  },
+  "template": "minecraft:iron_block"
+}

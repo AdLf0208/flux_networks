@@ -1,0 +1,6 @@
+{
+  "model": {
+    "model": "fluxnetworks:item/flux_controller",
+    "type": "minecraft:model"
+  }
+}
