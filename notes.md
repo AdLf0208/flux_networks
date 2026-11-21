@@ -209,6 +209,8 @@ itself publish it (licence approval is still required, ARCHITECTURE.md §8).
    recipe types upstream).
 10. **`flux_dust` has no source recipe**: upstream's "creating flux" is a code
     recipe with no data file, so the crafting chain starts at `flux_core`.
+    **Closed in slice 2** (`## Slice 2 — creating flux`): the mechanic is ported and every carried
+    shaped recipe now crafts in game.
 11. **A harness `energy` command writes a buffer directly.** It is a test
     control, not upstream gameplay (same precedent as `/powah set`).
 12. **The slice is not the whole mod**: the controller's behaviour, the
@@ -591,3 +593,315 @@ capacity)`) gives **14**; the new glue test pins 14.
 | Uses | `unzip -p fluxnetworks.hmod uses.json` | 244 entries (`sdk-uses.json`) |
 
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port
+
+## Review fixes (2026-11-18)
+
+Source review of PR **#1239** (`var/review/1239-fluxnetworks.md`). Both findings are fixed in
+**0.2.1**, and the first in-game run of the 0.2.x package (which this job also completed) found and
+fixed a carried-data defect that stopped the world from loading at all.
+
+| # | Finding (`file:line`) | What a player could do | Fix | Test that pins it |
+|---|---|---|---|---|
+| 1 | `src/lib.rs:281` — level-0 energy/network/priority on any loaded device | a non-operator created or erased FE and reassigned or redirected another player's network at coordinates they chose, with no distance or ownership check | `declare_commands` registers all four usages (`info`, `energy`, `network`, `priority`) with `Command::op(…, 2)`; the dispatcher refuses them below game-master permission before any listener runs. All four are the harness surface for upstream's configurator GUI, which is not ported, so they are operator diagnostics | `tests::the_device_commands_are_operator_only` — RED on the 0.2.0 registration (`left: 0, right: 2`, `evidence/fluxnetworks/review-test-red.log`), GREEN after |
+| 2 | `src/lib.rs:240` — a limiter entry per network id, only cleared at a world lifecycle event | reassigning devices to new ids through the operator command grew the table (and the linear search per tick) without bound | `BoundedLimiter`: at most **256** networks (`LIMITER_CAP`), oldest first out, one value per `(level, network)`; a forgotten network simply starts from a full pull again next cycle, so no energy is lost. `world_lifecycle` still clears it | `tests::the_limiter_table_is_bounded` — RED on the unbounded table (1024 entries kept vs the 256 cap), GREEN after; it also pins that updating a remembered id neither grows the table nor moves it |
+
+### Carried-data defect the first run exposed (fixed, not reproduced)
+
+The first `launcher-game.sh run fluxnetworks` (0.2.1, before this fix) ended `EXIT:1` with the
+server refusing to load: *"Couldn't parse data file {fluxnetworks:blocks/…@minecraft:loot_table}
+.pools[0].condition: No key type in predicate {\"condition\":\"minecraft:survives_explosion\"}"*
+(`evidence/fluxnetworks/first-run-loot.log`). All **seven** carried block loot tables still had the
+1.21.1 wrapper `{"condition": {"condition": "minecraft:survives_explosion"}}`. The 26.3 shape is the
+typed condition `{"condition": {"type": "minecraft:survives_explosion"}}`
+(`ports/_shared/AGENT_MOD_STRUCTURE.md` §6), which is what powah's carried tables already use.
+Each file is now `{"condition": {"type": "minecraft:survives_explosion"}}` and the world loads.
+This is **fail-capable evidence by itself**: with the old bytes the server stops at the first tick,
+so the e2e cannot run at all. (The carry came from the 1.21.1 jar; the upgrade was missed, not an
+upstream bug.)
+
+### Verification (0.2.1)
+
+| Step | Command | Result |
+|---|---|---|
+| unit tests | `cargo test` | **31 passed**, 0 failed (`evidence/fluxnetworks/sdk-test.log`) |
+| lints | `cargo clippy --all-targets -- -D warnings` | exit 0, no warning (`evidence/fluxnetworks/sdk-clippy.log`) |
+| formatting | `cargo fmt --check` | exit 0, empty (`evidence/fluxnetworks/sdk-fmt.log`) |
+| package, twice | `rm -f Cargo.lock; cargo horizon-mod build` ×2, `cmp` | **byte-identical**, 126,922 B (`evidence/fluxnetworks/sdk-build{,-second}.log`) |
+| registry check | `cargo horizon-mod check fluxnetworks.hmod` | **exit 0**, 126,922 B, SHA-256 `9e4c845c…c65d06` (`evidence/fluxnetworks/sdk-check.log`) |
+| fits the build | `cargo horizon-mod fits fluxnetworks.hmod --build nightly` | `Flux Networks: / 0b14f8a  made for`, **exit 0** (`evidence/fluxnetworks/sdk-fits.log`) |
+| in-game | `ports/tools/launcher-game.sh run fluxnetworks` | `PASS: …` + `EXIT:0` (`evidence/fluxnetworks-e2e/e2e-launcher.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME … bash ports/fluxnetworks/tools/e2e.sh` | `FAIL: expected fluxnetworks:herculean_flux_storage at 0,100,0, got 'minecraft:air'` + `EXIT:1` |
+| selftest | `SELFTEST=1 …` | `FAIL: SELFTEST flipped: an unlinked network moved no energy, as it should` + `EXIT:1` |
+| log gate | `python3 ports/tools/check-e2e-logs.py fluxnetworks-e2e --strict` | `logs=3 ok=3 missing-exit=0 bad-exit=0`, exit 0 |
+
+Harness-only change: the scenario's scratch and socket paths now honour `E2E_TMP`
+(`${E2E_TMP:-/tmp/opencode}`), because this box's `/tmp` is a full tmpfs (the launcher wrapper
+exports `E2E_TMP` under `~/.cache/horizon-e2e`). No assertion changed.
+
+**A rebuild is needed after a data-only change.** `launcher-game.sh run` reuses an existing export,
+and `built_tag` matches a built version by a byte-identical `horizon-mod.toml`; a changed `data/`
+file does not invalidate either, so the first run after the loot fix still loaded the old content.
+Removing that mod's `versions/native-*` folder and its export forced the rebuild. Recorded so the
+next data-only fix does not lose a run.
+
+Package: `fluxnetworks.hmod`, **126,922 B**, sha256
+`9e4c845c1931599da64e82ae678a51ada7f715ef458057feb88b63b578c65d06`.
+
+## Slice 2 — creating flux: the flux-dust source, and the seven carried recipes proven (2026-11-21)
+
+**Pin:** Horizon `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` (Nightly 2026-11-20) + horizon-mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, `package_format` 6, `content_api` 0.2. Version
+**0.2.2**. The manifest moved with the campaign pin this wave; `cargo horizon-mod update` reported
+"none of the 346 items it uses changed", so no source had to change for the repin.
+
+### The gap this slice closes
+
+`## Deviations and gaps (slice 1)` item 10:
+
+> 10. **`flux_dust` has no source recipe**: upstream's "creating flux" is a code
+>     recipe with no data file, so the crafting chain starts at `flux_core`.
+
+Measured in the shipped 0.2.1 data: `flux_core`, `flux_block`, `flux_plug`, `flux_point`,
+`flux_controller`, `basic_flux_storage` and `flux_configurator` **all need
+`fluxnetworks:flux_dust`**, and nothing produced it. All seven carried recipes were dead data: a
+player could not obtain a single Flux Networks item in survival, however long they played. This is
+the highest-value remaining family, and it is a **recipe** family, which the parity rule names as
+the sharpest case.
+
+### What upstream does (analysis; clean-room rewrite)
+
+`SonarSonic/Flux-Networks` branch `1.21`, commit `ea8b6e0cf708098ab2f02bf5c3d5c1f0ed2a1f5f`
+(shallow clone at `ports/_shared/upstream/fluxnetworks`, deleted after these findings were recorded).
+
+| File | What it fixes |
+|---|---|
+| `register/EventHandler.onPlayerInteract` (`LeftClickBlock`, `receiveCanceled`) | **the mechanic.** The clicked block must be **obsidian**; the block **two below** must be **bedrock** or **a flux block**. Every **redstone** item entity inside `new AABB(pos.below())` — the one-block gap between them — is counted and discarded, stopping at `itemCount >= 512`. That many **flux dust** item entities spawn at the click (`.setNoPickUpDelay()`, motion `(0, 0.2, 0)`), the obsidian is removed, and one `nextDouble() > Math.pow(0.9, itemCount >> 3)` roll decides whether the gap becomes **cobblestone** (the press collapses) or **the obsidian** (it slid down one). Sounds: `entity.dragon_fireball.explode` for cobblestone, `entity.generic.explode` otherwise; `ParticleTypes.LAVA` count `Mth.clamp(itemCount >> 2, 4, 64)`. The click is cancelled. |
+| `FluxConfig` (`general`) | `enableFluxRecipe` default **true** ("redstone being compressed with the bedrock and obsidian to get flux dusts"). |
+| `client/jei/CreatingFluxRecipeCategory.getRecipes` | the JEI family is exactly two recipes — bedrock base and flux-block base, obsidian crusher, redstone in, flux dust out — which is the upstream statement of the two bases. |
+| `register/RegistryItems`, `common/item/FluxDustItem` | `flux_dust` is a plain item with a tooltip (already carried by the port). |
+| `EventHandler.onEntityAdded` (`FireItemEntity`, "old recipe") | **commented out upstream** — dead code, not ported. |
+
+**Tier:** class `content`, tier `machines`, unchanged. This is a block-interaction rule with item
+entities, block state and a level random — below the tier's ceiling (no block entity, no menu, no
+renderer), so the row is not re-tiered and nothing above `machines` is attempted.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `src/runtime.rs` | `CREATION_ENABLED`, `CREATION_CAP` (512), `creation_base_ok`, `is_crusher`, `created_dust`, `GapAfter`, `gap_after`, `creation_particles` — the whole rule, pure, with 5 new tests |
+| `src/lib.rs` | the `left_click_block` hook (the slice's one new hook), `flux_creation_site`, `take_redstone`, the dust spawn, and a `CreationKeys` cache resolved in `register` (`item_key`, `block_key`, `particle_key`) — **2 new glue tests**, 37 tests in total |
+| `tools/craft_check.py` | **new**: reads each carried `data/fluxnetworks/recipe/*.json`, gives exactly the pattern's ingredients, places them with right-clicks (grid 100–108, result 200), asserts the declared id and count, that the result reached the inventory, that the grid is empty and that **every ingredient was consumed by its declared count**; two wrong patterns must leave the result empty. Adapted from the proven `bigreactors/tools/craft_check.py`, but the patterns are read from the package instead of transcribed. |
+| `tools/e2e.sh` | five creation phases + the crafting phase, before slice 1's network phases (which are unchanged); launch moved `--headless` → `--offscreen`, because `click-slot` needs a renderer |
+| `horizon-mod.toml`, `Cargo.toml` | 0.2.1 → **0.2.2**; `[native] horizon` → `0a875da…` |
+
+The mechanic's site, as the hook sees it:
+
+```rust
+fn flux_creation_site(clicked: &str, base: &str) -> bool {
+    runtime::is_crusher(clicked) && runtime::creation_base_ok(base)
+}
+```
+with `is_crusher` = `minecraft:obsidian` and `creation_base_ok` = `minecraft:bedrock` or
+`fluxnetworks:flux_block`, both pinned by tests.
+
+### TDD: red, then green
+
+The family's rule first, as runtime tests, before any implementation:
+
+```
+error[E0425]: cannot find function `creation_base_ok` in this scope
+error[E0433]: cannot find type `GapAfter` in this scope
+error[E0425]: cannot find function `creation_particles` in this scope
+error: could not compile `fluxnetworks` (lib test) due to 33 previous errors
+```
+
+(`ports/_shared/evidence/fluxnetworks/slice2-red.log`.) Then the glue's own red:
+
+```
+error[E0425]: cannot find function `flux_creation_site` in this scope
+error: could not compile `fluxnetworks` (lib test) due to 5 previous errors
+```
+
+(`slice2-glue-red.log`.) Green: **37 passed, 0 failed** (`sdk-test.log`), clippy 0 warnings
+(`sdk-clippy.log`), `cargo fmt --check` clean (`sdk-fmt.log`).
+
+### The in-game leg (launcher 0.2.92, Nightly `nightly-2026-11-20-0a875da`)
+
+`ports/_shared/evidence/fluxnetworks-e2e/e2e-launcher.log` — `PASS` + `EXIT:0`. The creation
+phases, verbatim:
+
+```
+== creating flux: a stone base is refused (the differential) ==
+  redstone in the gap: 8 in 1 stack(s); dust 0
+  after the click: obsidian at 6,102,6 is 'minecraft:air', gap 'minecraft:air', redstone left 8, dust 0
+== creating flux: 8 redstone between bedrock and obsidian ==
+  redstone left 0; obsidian at 8,102,8 is 'minecraft:air'; gap 'minecraft:cobblestone'
+  dust 0 -> 8
+== creating flux: no redstone, nothing happens ==
+  dust 8 -> 8; gap 'minecraft:air'; redstone 0
+== creating flux: a flux block is the other base ==
+  dust 8 -> 16; gap 'minecraft:obsidian'
+== creating flux: 576 redstone gives 512 dust and leaves a stack ==
+  redstone in the gap: 576 in 9 stacks
+  redstone left 64 in 1 stack(s)
+  dust 16 -> 528
+== the seven carried shaped recipes, in a real crafting table ==
+  block(17,100,10) = minecraft:crafting_table
+flux_core -> {"count": 4, "item": "fluxnetworks:flux_core", "slot": 200}
+basic_flux_storage -> {"count": 1, "item": "fluxnetworks:basic_flux_storage", "slot": 200}
+flux_block -> {"count": 1, "item": "fluxnetworks:flux_block", "slot": 200}
+flux_configurator -> {"count": 1, "item": "fluxnetworks:flux_configurator", "slot": 200}
+flux_controller -> {"count": 1, "item": "fluxnetworks:flux_controller", "slot": 200}
+flux_plug -> {"count": 1, "item": "fluxnetworks:flux_plug", "slot": 200}
+flux_point -> {"count": 1, "item": "fluxnetworks:flux_point", "slot": 200}
+flux_core with minecraft:redstone (control) -> null
+flux_plug with minecraft:iron_ingot (control) -> null
+CRAFTED: 7 carried shaped recipes, each with its declared id and count, its ingredients consumed, and two wrong patterns left empty
+```
+
+The `flux_core` row consumed **4 of the flux dust the mechanic had just produced** (its dust is
+read from the inventory, not given), so the chain redstone → dust → core is one continuous run.
+The two wrong-pattern controls are in the log with a `null` result slot, and one differential is a
+*block*: obsidian on **stone** keeps its redstone and makes no dust (the same shape that works on
+bedrock two blocks above), so the base test cannot pass vacuously.
+
+Three legs, each fail-capable (`ports/_shared/evidence/fluxnetworks-e2e/`):
+
+| Leg | Result | Log |
+|---|---|---|
+| the same command on the package | `PASS` + `EXIT:0` | `e2e-launcher.log` |
+| the same command on the **same Nightly without the package** (`GAME=$CONTROL_GAME`) | `FAIL: the redstone was not consumed (8 left)` + `EXIT:1` | `e2e-launcher-control.log` |
+| `SELFTEST=1` (flips the stone-base assertion) | `FAIL: SELFTEST flipped: the redstone survived a stone base, as it should` + `EXIT:1` | `e2e-launcher-selftest.log` |
+
+`python3 ports/tools/check-e2e-logs.py fluxnetworks-e2e --strict` → `logs=4 ok=4
+missing-exit=0 bad-exit=0`.
+
+### Coverage (parity rule)
+
+| Family (the jar's) | State | Where |
+|---|---|---|
+| creating flux — bedrock base | **tested** | e2e `creating flux: 8 redstone between bedrock and obsidian` (8 redstone → 8 dust, obsidian consumed, gap obsidian or cobble) |
+| creating flux — flux-block base | **tested** | e2e `a flux block is the other base` (8 → 8 dust) |
+| creating flux — base test | **tested** | e2e `a stone base is refused` (differential: redstone left) |
+| creating flux — nothing to press | **tested** | e2e `no redstone, nothing happens` |
+| creating flux — 512 cap | **tested** | e2e `576 redstone gives 512 dust and leaves a stack` (512 dust, exactly one 64 stack left) |
+| creating flux — cobblestone roll / obsidian roll | **tested** | both outcomes observed across the runs (`gap 'minecraft:obsidian'` and `'minecraft:cobblestone'`); the rule is pinned by `a_bigger_batch_turns_the_gap_to_cobblestone_more_often` |
+| creating flux — dust into a recipe | **tested** | the `flux_core` row consumes 4 of the dust the mechanic made |
+| recipe `flux_core` (4) | **tested** | craft_check, declared id/count, 4 dust + 4 obsidian + 1 ender eye consumed |
+| recipe `flux_block` | **tested** | craft_check (5 dust + 4 cores) |
+| recipe `flux_plug` | **tested** | craft_check (4 cores + 1 flux block) |
+| recipe `flux_point` | **tested** | craft_check (4 cores + 1 redstone block) |
+| recipe `flux_controller` | **tested** | craft_check (5 flux blocks + 1 core + 2 dust) |
+| recipe `basic_flux_storage` | **tested** | craft_check (6 flux blocks + 2 glass panes) |
+| recipe `flux_configurator` | **tested** | craft_check (2 dust + 1 ender eye + 2 obsidian) |
+| recipe type `fluxnetworks:flux_storage_recipe` (2) | **not ported** | a custom recipe type; the data files are parked in `../_shared/evidence/fluxnetworks/outside/`. **Now expressible**: the pin has `Registrar::register_recipe_type` + `add_recipe_serializer`, so this is a candidate slice, not a gap in the pin. |
+| recipe type `fluxnetworks:config_wipe_recipe` (6) | **not ported** | same (custom recipe type, same `register_recipe_type` route) |
+| JEI "creating flux" page | **not ported** | client half; JEI is not a Horizon surface |
+| lava particles at the click | **requested, not measured** | `send_particles` with `particle_key("minecraft:lava")` and `Mth.clamp(count >> 2, 4, 64)`; the leg is `--offscreen` and no screenshot is claimed, so this is "code path exercised", not visual evidence |
+| both explosion sounds | **requested, not measured** | `play_sound` with the two vanilla events (`HORIZON_NO_AUDIO` is set in the leg) |
+
+### Deviations and API gaps (slice 2)
+
+1. **The dust ships as 64-stacks, not one entity.** Upstream spawns one item entity holding the
+   whole batch (`new ItemStack(FLUX_DUST, itemCount)`), up to 512. `LevelRef::spawn_item_with_motion`
+   refuses a stack above the item's limit — a 512-dust stack spawned **nothing** (measured: the
+   first cap run produced no dust entity at all), so the port spawns `ceil(dust / 64)` entities of at
+   most 64. The total, the count and the pickup are identical; recorded as an API difference.
+2. **A stack that crosses the 512 cap is consumed whole.** Upstream counts a stack and discards it,
+   then breaks at `itemCount >= 512`, so 9 stacks of 64 give 512 dust and the 9th stack survives only
+   because the break runs *before* it. That is upstream's own arithmetic and is kept (the e2e pins
+   it: 576 redstone → 512 dust, 64 left).
+3. **The config option is not ported** (`enableFluxRecipe`, default true). There is no config
+   surface in this package, so the mechanic is always on, which is what a default player gets.
+   Recorded rather than invented.
+4. **The removed obsidian is written with `NEIGHBORS | CLIENTS`.** `ctl block` reads the client's
+   level, and the first version wrote the removal with no flags (`NONE`), so the *server* had air
+   while the client still showed obsidian and the e2e read obsidian back — a harness-visible
+   difference that also matters to a player whose client would keep a ghost block. Vanilla's
+   `removeBlock` uses the same update flags.
+5. **No logger.** The SDK has none (recorded since the migration); a spawn the game refuses is
+   skipped silently, which is why the split in deviation 1 is a rule, not a fallback.
+6. **No JEI/EMI page and no client half.** Out of tier.
+
+No upstream *defect* was found in this slice; the 512 rounding above is upstream's design, recorded
+as a deviation.
+
+### Gaps after slice 2
+
+Everything the migration's gap list records still stands, except:
+
+- **closed:** `flux_dust` has no source recipe (this slice);
+- **closed by measurement:** the seven carried shaped recipes are no longer dead data;
+- **new, and now expressible:** the two custom recipe types (`flux_storage_recipe`,
+  `config_wipe_recipe`) can be registered at this pin (`register_recipe_type` +
+  `add_recipe_serializer`) — a later slice, not a blocker;
+- still open: no configurator GUI, no wireless charging, no chunk loading, network security,
+  statistics, connection rendering, waterlogging, breaking a device losing its FE/settings, the
+  block blacklist, and the client colour/tint half.
+
+### Ladder (0.2.2, `build-slot.sh` leases, `CARGO_INCREMENTAL=0`, no `--target-dir`)
+
+| Step | Command | Result | Evidence |
+|---|---|---|---|
+| tests | `cargo test --offline` | **37 passed**, 0 failed | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** | `sdk-clippy.log` |
+| format | `cargo fmt --check` | clean | `sdk-fmt.log` |
+| package ×2 | `rm -f Cargo.lock; cargo horizon-mod build`, twice, `cmp` | **byte-identical**, 133,581 B | `sdk-build.log`, `sdk-build-second.log` |
+| registry check | `cargo horizon-mod check fluxnetworks.hmod` | **exit 0**, 133,581 B, SHA-256 `a6d7c93e…f38b4` | `sdk-check.log` |
+| fits the pin | `cargo horizon-mod fits fluxnetworks.hmod --build 0a875da` | `0a875da  made for`, exit 0 | `sdk-fits.log` |
+| fits a **different** build | `cargo horizon-mod fits fluxnetworks.hmod --build 0b14f8a` | `0b14f8a  fits`, exit 0 | `sdk-fits.log` |
+| package gate | `python3 ports/tools/verify-sdk-package.py fluxnetworks` | **1/1** | this session |
+| entries | `unzip -l fluxnetworks.hmod` | **127 entries**, no `Cargo.lock` | `slice2-package-entries.txt` |
+| uses | `unzip -p fluxnetworks.hmod uses.json` | `made_for 0a875da…`, **345 entries** | `slice2-uses-summary.txt` |
+| runtime in the package | `unzip -p … src/runtime.rs \| sha256sum` | `8cbbdb78…a06fe4f`, same as the tree | this session |
+
+`check` output, verbatim:
+
+```
+fluxnetworks 0.2.2 (native-mod, format native-1/0a875da91dbb0fdcb7ba8c42c11341aa229af51a/e59da9094f0c2fdda6c627fe9eff22dec6a906f0, for 26.3)
+  133581 bytes, SHA-256 a6d7c93ecf4b9db2dcd81669bae99dc1194889a71ccbf79b24b94bd58e5f38b4, unsigned
+  native source: unsandboxed; not executed by the registry check. Compile and test against the exact pinned Horizon and Mixins revisions before review.
+```
+
+`fits`, both lines in one log (`sdk-fits.log`):
+
+```
+== fits --build 0a875da (the pin: made for) ==
+Flux Networks:
+0a875da  made for
+FITS_PIN_EXIT:0
+== fits --build 0b14f8a (the previous build: the real check) ==
+Flux Networks:
+0b14f8a  fits
+FITS_OLD_EXIT:0
+```
+
+### Traps this slice cost
+
+1. **`ctl block` reads the client level.** A server-side write without `CLIENTS` leaves a ghost block
+   the harness reads back (see deviation 4). Use `NEIGHBORS | CLIENTS`, as vanilla's `UPDATE_ALL`.
+2. **A player one block from the press eats the redstone.** The first run measured 0 redstone because
+   the player stood adjacent and picked the pile up before the click; the press is now worked from two
+   blocks away and the pile is collected afterwards.
+3. **A leftover pile poisons the next assertion.** The stone-base control must *keep* its redstone, so
+   it is killed (`execute positioned … run kill @e[type=minecraft:item,distance=..2]`) before the
+   later phases; counting by radius around the player alone is not enough.
+4. **Spawn a batch as stacks, never as one oversized stack** (deviation 1) — the refused spawn is
+   silent and the redstone is already gone.
+5. **`click-slot` needs a renderer**: the leg launches `--offscreen`, not `--headless`.
+6. **The launcher reuses a build whose `horizon-mod.toml` is unchanged.** A source-only edit inside
+   the same version is invisible until the `versions/native-*` folder carrying the mod *and* the
+   export under `~/.cache/horizon-e2e/<pin>/<mod>` are removed (this cost one run).
+7. **The launcher reads the port's root `.hmod` for its compatibility check.** A stale package there
+   (0.2.1, old pin) made `native-build` refuse the mod with *"made by an older tool … works on the
+   Nov 20 update only"*; replacing it with the current build fixed it.
+8. **The `e2e` instance was bound to a 0b14f8a build.** `native-build` reuses the *instance's* base
+   version, so a package pinned to `0a875da` is left out on it; the build now runs with
+   `HORIZON_E2E_INSTANCE=fluxnetworks-e2e`, a fresh instance on the new Nightly (the other agents'
+   per-mod instance names are the same convention).
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review
+
+Package: `fluxnetworks.hmod`, **133,581 B**, sha256
+`a6d7c93ecf4b9db2dcd81669bae99dc1194889a71ccbf79b24b94bd58e5f38b4`.

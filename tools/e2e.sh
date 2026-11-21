@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# In-game check for Flux Networks slice 1 (SDK package 0.2.0): one energy network on a real game.
+# In-game check for Flux Networks (SDK package 0.2.2): one energy network, the
+# "creating flux" mechanic that makes flux dust, and every carried shaped recipe
+# in a real crafting table.
 #
-# STATUS (2026-11-18): this scenario needs a game the **launcher built with this package**
-# (`horizon-launcher native-build ports/fluxnetworks --instance <instance> --trust-native-code`),
-# because a native `.hmod` is compiled into the game and carries its own assets and data. No
-# launcher and no `0b14f8a` game build exist in this environment, so the run below is **not**
-# claimed for 0.2.0; the 0.1.0 runs in `ports/_shared/evidence/fluxnetworks/` (e2e-embedded*.log,
-# e2e-pre-embedding*.log) are the behaviour's last in-game evidence, for a `src/runtime.rs` that
-# did not change. The assertions are unchanged from 0.1.0: they are the behaviour's proof, and
-# only the launch path moved.
+#   GAME=<launcher-built horizon-client>  required: the game with this package compiled in
+#   CONTROL_GAME=<a game without it>      optional: proves the arena needs the package (both ids
+#                                         unknown there); skipped with a NOTE when unset
+#   CTL=<horizon-ctl>                     optional: defaults to the pin-matched shared control
+#   SELFTEST=1                            flips an assertion, so the run must FAIL
+#
+# The leg launches `--offscreen` (not `--headless`): `click-slot`, which the
+# crafting phase needs, requires a renderer.
 #
 #   GAME=<launcher-built horizon-client>  required: the game with this package compiled in
 #   CONTROL_GAME=<a game without it>      optional: proves the arena needs the package (both ids
@@ -57,7 +59,7 @@ GAME=${GAME:-}
 CONTROL_GAME=${CONTROL_GAME:-}
 RES=${RES:-${HORIZON_RES:-$ROOT/resources/26.3}}
 [ -d "$RES/assets" ] || RES=/home/adlf/Desktop/horizon/.local/horizon-client/26.3
-SOCK=${SOCK:-/tmp/opencode/fluxnetworks-e2e.sock}
+SOCK=${SOCK:-${E2E_TMP:-/tmp/opencode}/fluxnetworks-e2e.sock}
 SELFTEST=${SELFTEST:-0}
 KEEP=${KEEP:-0}
 WORLD=FluxNetworksE2E
@@ -72,7 +74,7 @@ fi
 [ -x "$GAME" ] || { echo "missing horizon-client: $GAME" >&2; exit 1; }
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
 
-SCRATCH=$(mktemp -d /tmp/opencode/fluxnetworks-home.XXXXXX)
+SCRATCH=$(mktemp -d "${E2E_TMP:-/tmp/opencode}/fluxnetworks-home.XXXXXX")
 export HORIZON_HOME=$SCRATCH/game
 export HORIZON_LAUNCHER_HOME=$SCRATCH/launcher
 export XDG_DATA_HOME=$SCRATCH/data
@@ -105,7 +107,7 @@ launch() { # launch [WORLD] [GAME]
     # No --dev-mod: the package's code, assets and data are compiled into the game by the
     # launcher, and a native .hmod cannot load on an unmodded one.
     "$CTL" --socket "$SOCK" launch --game "$game" --world "$world" --seed 20261105 \
-        --creative --headless --wait --resources "$RES" >/dev/null
+        --creative --offscreen --wait --resources "$RES" >/dev/null
     ctrl wait-ready 120
     ctrl wait 40
 }
@@ -247,6 +249,151 @@ control_leg
 launch
 arena
 
+# ---- slice 2: "creating flux" ---------------------------------------------------------------
+# Upstream's `EventHandler.onPlayerInteract`: an obsidian block with a bedrock (or flux-block)
+# base two blocks below it, redstone items lying in the block between, and a left-click on the
+# obsidian. The click is cancelled: the obsidian is spent, the redstone becomes one flux dust
+# per item (at most 512), and the gap becomes cobblestone or the obsidian that slid down.
+
+block_name() { ctrl block "$1" "$2" "$3" | jq -r '.name // .block // empty'; }
+dust() { ctrl inventory | jq -r '.counts["fluxnetworks:flux_dust"] // 0'; }
+# The redstone item entities **in one press's column** (a previous press's pile is still on the
+# ground a few blocks away, so a radius around the player would count it); plus a whole-radius
+# count, for the cap phase, where the press's own pile is the only redstone left in the world.
+redstone_at() { # X Z: the matching items, one JSON object per line
+    ctrl entities 12 item | jq -c --argjson x "$1" --argjson z "$2" '
+        .entities[]
+        | select(.kind == "item" and .item.item == "minecraft:redstone")
+        | select((.pos[0] - $x) < 0.9 and (.pos[0] - $x) > -0.9)
+        | select((.pos[2] - $z) < 0.9 and (.pos[2] - $z) > -0.9)'
+}
+redstone_stacks() { redstone_at "$1" "$2" | grep -c . || true; }
+redstone_items() { redstone_at "$1" "$2" | jq -s 'map(.item.count) | add // 0'; }
+redstone_near() {
+    ctrl entities 12 item \
+        | jq '[.entities[] | select(.kind == "item" and .item.item == "minecraft:redstone") | .item.count] | add // 0'
+}
+redstone_near_stacks() {
+    ctrl entities 12 item \
+        | jq '[.entities[] | select(.kind == "item" and .item.item == "minecraft:redstone")] | length'
+}
+# Drop every item at a press: used after a control that must *leave* its redstone, so later
+# phases count only their own pile.
+clear_at() { # X Z
+    ctrl command "execute positioned $1 101 $2 run kill @e[type=minecraft:item,distance=..2]" >/dev/null
+    ctrl wait 4
+}
+# press_base X Z BASE: the base block at y=100, air in the gap, obsidian at y=102.
+press_base() {
+    ctrl command "setblock $1 100 $2 $3" >/dev/null
+    ctrl command "setblock $1 101 $2 minecraft:air" >/dev/null
+    ctrl command "setblock $1 102 $2 minecraft:obsidian" >/dev/null
+    ctrl wait 4
+}
+# stand_by X Z: two blocks from the press, out of item-pickup range (a player one block away
+# would swallow the redstone before the click and the assertion would count nothing), and well
+# inside the reach of the obsidian at y=102.
+stand_by() { ctrl tp "$(( $1 + 2 )).5" 100 "$2.5" >/dev/null; ctrl wait 6; }
+# collect X Z: step next to the press and take what the click dropped.
+collect() { ctrl tp "$(( $1 + 1 )).5" 100 "$2.5" >/dev/null; ctrl wait 20; }
+# summon_redstone X Z TOTAL: whole stacks of 64, in the gap block at y=101.
+summon_redstone() {
+    local left=$3 stack
+    while [ "$left" -gt 0 ]; do
+        stack=$(( left > 64 ? 64 : left ))
+        ctrl command "summon minecraft:item $1.5 101.0 $2.5 {Item:{id:\"minecraft:redstone\",count:$stack}}" >/dev/null
+        left=$(( left - stack ))
+    done
+    ctrl wait 6
+}
+# click_obsidian X Z: left-click the press's obsidian until it is gone (a cancelled click removes
+# it; a plain mine breaks it). `break` waits for that, so it returns as soon as the block is air.
+click_obsidian() { ctrl break "$1" 102 "$2" >/dev/null 2>&1 || true; ctrl wait 20; }
+
+echo "== creating flux: a stone base is refused (the differential) =="
+stand_by 6 6
+press_base 6 6 minecraft:stone
+summon_redstone 6 6 8
+before_dust=$(dust)
+echo "  redstone in the gap: $(redstone_items 6 6) in $(redstone_stacks 6 6) stack(s); dust $before_dust"
+click_obsidian 6 6
+after_dust=$(dust)
+gap=$(block_name 6 101 6)
+echo "  after the click: obsidian at 6,102,6 is '$(block_name 6 102 6)', gap '$gap', redstone left $(redstone_items 6 6), dust $after_dust"
+[ "$(redstone_items 6 6)" = 8 ] || fail "a stone base consumed the redstone ($(redstone_items 6 6) left)"
+[ "$after_dust" = "$before_dust" ] || fail "a stone base made flux dust ($before_dust -> $after_dust)"
+[ "$(block_name 6 102 6)" = "minecraft:air" ] || fail "the stone-based obsidian was not mined, so the click was cancelled anyway"
+if [ "$SELFTEST" = 1 ]; then
+    echo "  SELFTEST: expecting the stone base to have eaten the redstone (this must fail)"
+    [ "$(redstone_items 6 6)" != 8 ] || fail "SELFTEST flipped: the redstone survived a stone base, as it should"
+fi
+# This control keeps its pile on purpose; the later phases count their own press only.
+clear_at 6 6
+
+echo "== creating flux: 8 redstone between bedrock and obsidian =="
+stand_by 8 8
+press_base 8 8 minecraft:bedrock
+summon_redstone 8 8 8
+before_dust=$(dust)
+click_obsidian 8 8
+left=$(redstone_items 8 8)
+gap=$(block_name 8 101 8)
+echo "  redstone left $left; obsidian at 8,102,8 is '$(block_name 8 102 8)'; gap '$gap'"
+[ "$left" = 0 ] || fail "the redstone was not consumed ($left left)"
+[ "$(block_name 8 102 8)" = "minecraft:air" ] || fail "the obsidian was not consumed"
+case "$gap" in
+    minecraft:cobblestone | minecraft:obsidian) ;;
+    *) fail "the gap below became '$gap', not cobblestone or the obsidian" ;;
+esac
+collect 8 8
+after_dust=$(dust)
+echo "  dust $before_dust -> $after_dust"
+[ $(( after_dust - before_dust )) -eq 8 ] || fail "8 redstone made $(( after_dust - before_dust )) flux dust"
+
+echo "== creating flux: no redstone, nothing happens =="
+stand_by 10 10
+press_base 10 10 minecraft:bedrock
+before_dust=$(dust)
+click_obsidian 10 10
+after_dust=$(dust)
+echo "  dust $before_dust -> $after_dust; gap '$(block_name 10 101 10)'; redstone $(redstone_items 10 10)"
+[ "$after_dust" = "$before_dust" ] || fail "an empty press made flux dust"
+[ "$(block_name 10 101 10)" = "minecraft:air" ] || fail "an empty press wrote a block into the gap"
+
+echo "== creating flux: a flux block is the other base =="
+stand_by 12 12
+press_base 12 12 fluxnetworks:flux_block
+summon_redstone 12 12 8
+before_dust=$(dust)
+click_obsidian 12 12
+[ "$(redstone_items 12 12)" = 0 ] || fail "a flux-block press did not consume its redstone"
+collect 12 12
+after_dust=$(dust)
+echo "  dust $before_dust -> $after_dust; gap '$(block_name 12 101 12)'"
+[ $(( after_dust - before_dust )) -eq 8 ] || fail "a flux-block base made $(( after_dust - before_dust )) flux dust"
+
+echo "== creating flux: 576 redstone gives 512 dust and leaves a stack =="
+stand_by 14 14
+press_base 14 14 minecraft:bedrock
+summon_redstone 14 14 576
+before_dust=$(dust)
+echo "  redstone in the gap: $(redstone_items 14 14) in $(redstone_stacks 14 14) stacks"
+click_obsidian 14 14
+left=$(redstone_near)
+stacks=$(redstone_near_stacks)
+echo "  redstone left $left in $stacks stack(s)"
+[ "$left" = 64 ] || fail "the cap left $left redstone, not the ninth stack"
+[ "$stacks" = 1 ] || fail "the cap left $stacks stacks, not one"
+collect 14 14
+after_dust=$(dust)
+echo "  dust $before_dust -> $after_dust"
+[ $(( after_dust - before_dust )) -eq 512 ] || fail "576 redstone made $(( after_dust - before_dust )) dust, not the 512 cap"
+
+echo "== the seven carried shaped recipes, in a real crafting table =="
+place 17 100 10 minecraft:crafting_table
+python3 "$PORT/tools/craft_check.py" "$SOCK" "$CTL" 17 100 10 "$PORT" \
+    || fail "a carried recipe did not craft (see the rows above)"
+
 echo "== place the source, the plug, the point and the receiver =="
 place 0 100 0 fluxnetworks:herculean_flux_storage
 place 1 100 0 fluxnetworks:flux_plug
@@ -369,4 +516,4 @@ echo "  source: $full_source -> $after_full_source"
 [ "$(energy_of "$after_full_source")" = "$(energy_of "$full_source")" ] \
     || fail "the source drained into a network with nothing to fill: $after_full_source"
 
-echo "PASS: an unlinked network moved nothing; joined, the plug drained the source at 120,000 FE/t, the network carried it two blocks to the point, the point filled the receiver, FE was conserved, a point on another network carried nothing, and a full receiver refused more"
+echo "PASS: redstone between bedrock or a flux block and obsidian becomes flux dust on a left-click (a stone base is refused, an empty press does nothing, 576 redstone gives 512 dust and leaves a stack), all seven carried shaped recipes craft with their declared id and count and consume their ingredients (two wrong patterns stay empty), an unlinked network moved nothing; joined, the plug drained the source at 120,000 FE/t, the network carried it two blocks to the point, the point filled the receiver, FE was conserved, a point on another network carried nothing, and a full receiver refused more"

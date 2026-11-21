@@ -25,9 +25,11 @@ BUILD_LOCAL=1 ports/tools/build-slot.sh run --job fluxnetworks-sdk --port ports/
   `build` packs the `.hmod`; it does **not** compile against the game — that is
   `horizon-launcher native-build . --instance <instance> --trust-native-code`, which is not
   installed in this environment (so no in-game claim is made for 0.2.0).
-- **`src/runtime.rs` is byte-identical to the retired bundle's `runtime.rs` and must stay so**: the
-  behaviour rules live there (`0902dbea…8cdf`); `src/lib.rs` only converts SDK types to theirs. New
-  rule → a test in `runtime.rs`; new glue → a private fn and a test in `lib.rs`.
+- **`src/runtime.rs` was byte-identical to the retired bundle's `runtime.rs` in the migration slice**
+  (`0902dbea…8cdf`, `cmp` clean at 0.2.0); from slice 2 it also carries the new rules, each with its
+  test. The behaviour rules live there (`plan_cycle`, `created_dust`, `gap_after`, …); `src/lib.rs`
+  only converts SDK types to theirs. New rule → a test in `runtime.rs`; new glue → a private fn and a
+  test in `lib.rs`.
 - Only the API the SDK publishes: `cargo horizon-mod hooks <text>` finds the exact method; never
   guess a name, and record an API gap in `notes.md` instead of faking one.
 - The energy a device holds lives in its block entity's saved `energy` int

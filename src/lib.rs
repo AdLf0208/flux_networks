@@ -23,20 +23,23 @@
 
 pub mod runtime;
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTickReply,
-    BlockEntityTicksEvent, BlockPart, Command, CommandArgumentValue, CommandInvocation, Compound,
-    Direction, ENERGY, Flow, Hooks, Host, HostSide, HostTransaction, LevelRef, LevelSide,
-    LevelTickPostEvent, ModEnergyBuffer, RegisterCommandsEvent, Registrar, RegistrationContext,
-    RunModCommandEvent, ServerHost, Tag, Text, WorldLifecycleEvent, move_energy,
+    BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, BlockUpdateFlags, Command,
+    CommandArgumentValue, CommandInvocation, Compound, Direction, ENERGY, Flow, Hooks, Host,
+    HostBlockStates, HostSide, HostTransaction, ItemKey, ItemStack, LeftClickBlockEvent, LevelRef,
+    LevelSide, LevelTickPostEvent, ModEnergyBuffer, ParticleKey, ParticleOptions, RandomSource,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RunModCommandEvent, ServerHost,
+    SoundSource, Tag, Text, WorldLifecycleEvent, move_energy,
 };
 
 use crate::runtime::{
     BASIC_CAPACITY, BASIC_TRANSFER, DEFAULT_LIMIT, Device, DeviceKind, GARGANTUAN_CAPACITY,
-    GARGANTUAN_TRANSFER, HERCULEAN_CAPACITY, HERCULEAN_TRANSFER, INVALID_NETWORK, clamp_priority,
-    comparator_strength, plan_cycle, plug_pull, point_push, pull_cap,
+    GARGANTUAN_TRANSFER, GapAfter, HERCULEAN_CAPACITY, HERCULEAN_TRANSFER, INVALID_NETWORK,
+    clamp_priority, comparator_strength, created_dust, creation_particles, gap_after, plan_cycle,
+    plug_pull, point_push, pull_cap,
 };
 
 /// The five devices (`RegistryBlocks` in the jar): a plug, a point and the three storages.
@@ -47,6 +50,28 @@ const HERCULEAN_STORAGE: &str = "fluxnetworks:herculean_flux_storage";
 const GARGANTUAN_STORAGE: &str = "fluxnetworks:gargantuan_flux_storage";
 /// The carried but inert controller, named by the readout so a player knows why it does nothing.
 const CONTROLLER: &str = "fluxnetworks:flux_controller";
+
+/// The blocks and the item the "creating flux" mechanic names (upstream's `Blocks.OBSIDIAN`,
+/// `Blocks.BEDROCK`, `RegistryBlocks.FLUX_BLOCK`, `Items.REDSTONE` and `RegistryItems.FLUX_DUST`).
+const OBSIDIAN: &str = "minecraft:obsidian";
+const REDSTONE: &str = "minecraft:redstone";
+const FLUX_DUST: &str = "fluxnetworks:flux_dust";
+
+/// A vanilla item's stack size: the dust one item entity carries at most (flux dust's template is
+/// redstone). `spawn_item_with_motion` refuses a stack above the limit, so a batch is split.
+const DUST_PER_STACK: i32 = 64;
+
+/// The keys a hook cannot look up by name, resolved once in [`Hooks::register`]: the dust item,
+/// the three block states the mechanic writes and the lava particle.
+struct CreationKeys {
+    flux_dust: ItemKey,
+    air: BlockKey,
+    cobblestone: BlockKey,
+    obsidian: BlockKey,
+    lava: ParticleKey,
+}
+
+static CREATION_KEYS: OnceLock<CreationKeys> = OnceLock::new();
 
 /// Answer of the readout when the position holds no device (byte-identical to 0.1.0, which the
 /// e2e asserts on).
@@ -215,30 +240,65 @@ enum Subcommand {
 static QUEUE: Mutex<Vec<(LevelRef, [i32; 3])>> = Mutex::new(Vec::new());
 
 /// `ServerFluxNetwork.mBufferLimiter`: what each network asked for in its last cycle, so a plug
-/// does not pull energy nothing wants.
-static LIMITER: Mutex<Vec<(LevelRef, i32, i32)>> = Mutex::new(Vec::new());
+/// does not pull energy nothing wants. Keyed by `(level, network id)`, and bounded: the operator
+/// command can move a device to a new network id, so a table keyed by id alone would grow for as
+/// long as someone keeps numbering new networks. At most [`LIMITER_CAP`] networks are remembered,
+/// oldest first out; a forgotten network simply starts from a full pull again next cycle (the
+/// `limiter_of` default, 0, means "no limit yet").
+const LIMITER_CAP: usize = 256;
+
+/// A small FIFO-bounded map: one value per key, and at most [`LIMITER_CAP`] keys.
+#[derive(Default)]
+struct BoundedLimiter<K> {
+    entries: Vec<(K, i32)>,
+}
+
+impl<K: PartialEq> BoundedLimiter<K> {
+    fn get(&self, key: &K) -> i32 {
+        self.entries
+            .iter()
+            .find(|(stored, _)| stored == key)
+            .map_or(0, |(_, value)| *value)
+    }
+
+    fn set(&mut self, key: K, value: i32) {
+        if let Some((_, stored)) = self.entries.iter_mut().find(|(stored, _)| *stored == key) {
+            *stored = value;
+            return;
+        }
+        if self.entries.len() >= LIMITER_CAP {
+            // Oldest first out: a forgotten network asks for a full pull again.
+            self.entries.remove(0);
+        }
+        self.entries.push((key, value));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+static LIMITER: Mutex<BoundedLimiter<(LevelRef, i32)>> = Mutex::new(BoundedLimiter {
+    entries: Vec::new(),
+});
 
 fn limiter_of(level: LevelRef, network: i32) -> i32 {
-    let limiters = LIMITER
+    LIMITER
         .lock()
-        .expect("the limiter lock is held for one read");
-    limiters
-        .iter()
-        .find(|(queued_level, id, _)| *queued_level == level && *id == network)
-        .map_or(0, |(_, _, value)| *value)
+        .expect("the limiter lock is held for one read")
+        .get(&(level, network))
 }
 
 fn set_limiter(level: LevelRef, network: i32, value: i32) {
-    let mut limiters = LIMITER
+    LIMITER
         .lock()
-        .expect("the limiter lock is held for one write");
-    match limiters
-        .iter_mut()
-        .find(|(queued_level, id, _)| *queued_level == level && *id == network)
-    {
-        Some((_, _, stored)) => *stored = value,
-        None => limiters.push((level, network, value)),
-    }
+        .expect("the limiter lock is held for one write")
+        .set((level, network), value);
 }
 
 fn queue(level: LevelRef, pos: [i32; 3]) {
@@ -251,6 +311,25 @@ fn queue(level: LevelRef, pos: [i32; 3]) {
     }
 }
 
+/// The four usages `/fluxnetworks` declares. All are administrative: each reads or writes a
+/// device at coordinates the caller chooses, so they are operator diagnostics (level 2), not
+/// gameplay. Upstream's own control surface is its configurator GUI, which is not ported.
+fn declare_commands(commands: &mut Vec<Command>) {
+    commands.push(Command::op("fluxnetworks info <pos:block_pos>", 2));
+    commands.push(Command::op(
+        "fluxnetworks energy <amount:integer> <pos:block_pos>",
+        2,
+    ));
+    commands.push(Command::op(
+        "fluxnetworks network <id:integer> <pos:block_pos>",
+        2,
+    ));
+    commands.push(Command::op(
+        "fluxnetworks priority <priority:integer> <pos:block_pos>",
+        2,
+    ));
+}
+
 /// The mod has no settings; the only state is the two per-world tables above.
 #[derive(Default)]
 struct Mod;
@@ -259,7 +338,18 @@ struct Mod;
 impl Hooks for Mod {
     /// Declare the five devices' block entity types and energy buffers. A type is declared per
     /// block so the entity's id is the block's id, as the retired `block_entity` hook made it.
+    ///
+    /// The "creating flux" mechanic's keys are resolved here too: a hook gets no registrar, and a
+    /// name lookup is a registration-time act.
     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
+        let keys = CreationKeys {
+            flux_dust: r.item_key(FLUX_DUST),
+            air: r.block_key("minecraft:air"),
+            cobblestone: r.block_key("minecraft:cobblestone"),
+            obsidian: r.block_key(OBSIDIAN),
+            lava: r.particle_key("minecraft:lava"),
+        };
+        let _ = CREATION_KEYS.set(keys);
         for (block, _, _) in DEVICES {
             let key = r.block_key(block);
             let Some(buffer) = buffer_of(block) else {
@@ -274,19 +364,9 @@ impl Hooks for Mod {
     }
 
     /// `/fluxnetworks info|energy|network|priority` (upstream's configurator, as commands).
+    /// `/fluxnetworks info|energy|network|priority`: operator-only diagnostics (level 2).
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        event
-            .commands
-            .push(Command::new("fluxnetworks info <pos:block_pos>"));
-        event.commands.push(Command::new(
-            "fluxnetworks energy <amount:integer> <pos:block_pos>",
-        ));
-        event.commands.push(Command::new(
-            "fluxnetworks network <id:integer> <pos:block_pos>",
-        ));
-        event.commands.push(Command::new(
-            "fluxnetworks priority <priority:integer> <pos:block_pos>",
-        ));
+        declare_commands(event.commands);
     }
 
     /// The `/fluxnetworks` bodies.
@@ -356,6 +436,120 @@ impl Hooks for Mod {
                 }
             }
         }
+        Flow::Cancel
+    }
+
+    /// Upstream's `EventHandler.onPlayerInteract`: redstone lying between a bedrock (or flux
+    /// block) base and an obsidian block becomes flux dust when the player left-clicks the
+    /// obsidian. The click is cancelled — the obsidian is not mined — and the press collapses:
+    /// the gap below becomes cobblestone or the obsidian, which has slid down one.
+    fn left_click_block(&self, host: &mut dyn ServerHost, event: &mut LeftClickBlockEvent) -> Flow {
+        if !runtime::CREATION_ENABLED {
+            return Flow::Continue;
+        }
+        let Some(keys) = CREATION_KEYS.get() else {
+            return Flow::Continue;
+        };
+        let Some(level) = level_in_place(host) else {
+            return Flow::Continue;
+        };
+        // The base is two below the click: the gap between them holds the redstone.
+        let base = [event.pos[0], event.pos[1].saturating_sub(2), event.pos[2]];
+        let Some(base) = level.block(host, base) else {
+            return Flow::Continue;
+        };
+        if !flux_creation_site(&event.state.block().id(host), &base.id(host)) {
+            return Flow::Continue;
+        }
+        let at = [
+            f64::from(event.pos[0]) + 0.5,
+            f64::from(event.pos[1]),
+            f64::from(event.pos[2]) + 0.5,
+        ];
+
+        // The three states the mechanic writes, resolved before any of them is used.
+        let (air, cobblestone, obsidian) = {
+            let states = host.block_states();
+            let Ok(air) = BlockState::of(&states, keys.air, &[]) else {
+                return Flow::Continue;
+            };
+            let Ok(cobblestone) = BlockState::of(&states, keys.cobblestone, &[]) else {
+                return Flow::Continue;
+            };
+            let Ok(obsidian) = BlockState::of(&states, keys.obsidian, &[]) else {
+                return Flow::Continue;
+            };
+            (air, cobblestone, obsidian)
+        };
+
+        // Only now is the redstone taken: the batch is gone either way, so nothing may be
+        // consumed before every block the mechanic writes is known to be resolvable.
+        let gap_pos = [event.pos[0], event.pos[1] - 1, event.pos[2]];
+        let redstone = take_redstone(host, level, gap_pos);
+        let dust = created_dust(redstone);
+        if dust == 0 {
+            return Flow::Continue;
+        }
+        // `level.removeBlock(pos, false)`: the obsidian is spent, whatever the roll says. The
+        // update goes to the clients too (`Block.UPDATE_ALL`): `ctl block` reads the client's
+        // level, and a dig in flight must see the block gone.
+        let removal = BlockUpdateFlags::NEIGHBORS | BlockUpdateFlags::CLIENTS;
+        let _ = level.set_block(host, event.pos, air, removal);
+
+        // The dust first, so a refused level write never eats the redstone for nothing. One item
+        // entity per stack: `spawn_item_with_motion` refuses a stack above the item's limit
+        // (512 dust in one stack spawns nothing at all), and a player sees the same eight stacks
+        // either way.
+        let mut left = dust;
+        while left > 0 {
+            let count = left.min(DUST_PER_STACK);
+            let Some(stack) = ItemStack::new(keys.flux_dust, u32::try_from(count).unwrap_or(1))
+            else {
+                break;
+            };
+            let Ok(Some(spawned)) =
+                level.spawn_item_with_motion(host, at[0], at[1], at[2], stack, [0.0, 0.2, 0.0], 0)
+            else {
+                break;
+            };
+            if let Some(item) = host.item_entity(spawned) {
+                let _ = item.set_no_pickup_delay(host);
+            }
+            left -= count;
+        }
+
+        // `nextDouble() > 0.9^(count >> 3)`: cobblestone, else the obsidian one block lower.
+        let roll = level
+            .with_random(host, |random| random.next_double())
+            .unwrap_or(0.0);
+        let collapsed = gap_after(dust, roll);
+        let gap_block = match collapsed {
+            GapAfter::Cobblestone => cobblestone,
+            GapAfter::Obsidian => obsidian,
+        };
+        let _ = level.set_block(
+            host,
+            gap_pos,
+            gap_block,
+            BlockUpdateFlags::NEIGHBORS | BlockUpdateFlags::CLIENTS,
+        );
+
+        let sound = match collapsed {
+            GapAfter::Cobblestone => "minecraft:entity.dragon_fireball.explode",
+            GapAfter::Obsidian => "minecraft:entity.generic.explode",
+        };
+        let _ = level.play_sound(host, sound, at, SoundSource::Blocks, 1.0, 1.0);
+        let _ = level.send_particles(
+            host,
+            &ParticleOptions::simple(keys.lava),
+            None,
+            at,
+            [0.0, 0.0, 0.0],
+            0.0,
+            creation_particles(dust),
+        );
+
+        event.cancelled = true;
         Flow::Cancel
     }
 
@@ -601,6 +795,47 @@ fn run_network(
     set_limiter(level, network, wanted);
 }
 
+/// Is this click the site of "creating flux"? Upstream's test: the clicked block is obsidian
+/// (`crusher.getBlock() == Blocks.OBSIDIAN`) and the block two below is bedrock or a flux block.
+fn flux_creation_site(clicked: &str, base: &str) -> bool {
+    runtime::is_crusher(clicked) && runtime::creation_base_ok(base)
+}
+
+/// Takes the redstone lying in the gap block below the obsidian and answers how much it took:
+/// upstream's `getEntitiesOfClass(ItemEntity.class, new AABB(pos.below()))`, counting each
+/// redstone stack and discarding it, stopping once 512 have been taken.
+///
+/// A stack that crosses the cap is consumed whole, as upstream consumes it, so the dust is capped
+/// and the rest of that stack is not returned (see notes.md).
+fn take_redstone(host: &mut dyn ServerHost, level: LevelRef, gap: [i32; 3]) -> i32 {
+    let min = [f64::from(gap[0]), f64::from(gap[1]), f64::from(gap[2])];
+    let max = [min[0] + 1.0, min[1] + 1.0, min[2] + 1.0];
+    let Some(entities) = level.entities_in(host, min, max) else {
+        return 0;
+    };
+    let mut taken = 0;
+    for entity in entities {
+        if taken >= runtime::CREATION_CAP {
+            break;
+        }
+        let Some(item) = host.item_entity(entity) else {
+            continue;
+        };
+        let Some(stack) = item.stack(host) else {
+            continue;
+        };
+        if stack.item().id(&*host) != REDSTONE {
+            continue;
+        }
+        taken += i32::try_from(stack.count()).unwrap_or(i32::MAX);
+        if !entity.discard(host) {
+            // A redstone the game will not remove is left where it is; it is not counted either.
+            taken -= i32::try_from(stack.count()).unwrap_or(0);
+        }
+    }
+    taken
+}
+
 /// The FE the buffer at `pos`, reached through `side`, holds right now; `None` where the side
 /// reaches no buffer.
 fn energy_of(
@@ -799,6 +1034,81 @@ fn feedback(host: &mut dyn ServerHost, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slice 2: the site of "creating flux" is an obsidian click with a bedrock or flux-block
+    /// base two below it (upstream's `EventHandler.onPlayerInteract`). The ids are the jar's and
+    /// the base test is the runtime's, so this pins the glue to both.
+    #[test]
+    fn a_creation_site_is_obsidian_on_a_bedrock_or_flux_block_base() {
+        assert!(flux_creation_site(
+            "minecraft:obsidian",
+            "minecraft:bedrock"
+        ));
+        assert!(flux_creation_site(
+            "minecraft:obsidian",
+            "fluxnetworks:flux_block"
+        ));
+        assert!(
+            !flux_creation_site("minecraft:stone", "minecraft:bedrock"),
+            "only obsidian is the crusher"
+        );
+        assert!(
+            !flux_creation_site("minecraft:obsidian", "minecraft:stone"),
+            "stone is not a base"
+        );
+        assert!(
+            !flux_creation_site("minecraft:obsidian", "minecraft:obsidian"),
+            "an obsidian base is not a base"
+        );
+    }
+
+    /// The review finding (2026-11-18): every usage acts on a device at player-chosen
+    /// coordinates, so a level-0 registration let any player create or erase FE and
+    /// reassign another player's network. Operator-only is the fix; this test fails on
+    /// a `Command::new` registration (level 0).
+    #[test]
+    fn the_device_commands_are_operator_only() {
+        let mut commands = Vec::new();
+        declare_commands(&mut commands);
+        assert_eq!(commands.len(), 4, "every usage is declared");
+        for command in &commands {
+            assert!(
+                command.usage.starts_with("fluxnetworks "),
+                "{} is this mod's",
+                command.usage
+            );
+            assert_eq!(
+                command.level, 2,
+                "{} is an administrative harness control",
+                command.usage
+            );
+        }
+    }
+
+    /// The review finding (2026-11-18): the limiter kept one entry per network id without
+    /// a bound, and the operator command can mint new ids, so the table (and the linear
+    /// search over it) grew for as long as someone kept doing that.
+    #[test]
+    fn the_limiter_table_is_bounded() {
+        let mut limiters = BoundedLimiter::default();
+        let ids = (LIMITER_CAP as i32) * 4;
+        for id in 0..ids {
+            limiters.set(id, id);
+        }
+        assert_eq!(
+            limiters.len(),
+            LIMITER_CAP,
+            "the table keeps at most {LIMITER_CAP} networks"
+        );
+        assert_eq!(limiters.get(&(ids - 1)), ids - 1, "the newest is kept");
+        assert_eq!(limiters.get(&0), 0, "the oldest is forgotten");
+        // Updating a remembered network does not grow the table or move its slot.
+        limiters.set(3, 99);
+        assert_eq!(limiters.len(), LIMITER_CAP);
+        assert_eq!(limiters.get(&3), 99);
+        limiters.clear();
+        assert_eq!(limiters.len(), 0, "a world change drops every entry");
+    }
 
     #[test]
     fn only_the_five_devices_declare_a_buffer() {

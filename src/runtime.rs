@@ -275,6 +275,63 @@ pub fn clamp_priority(priority: i32) -> i32 {
     priority.clamp(PRI_USER_MIN, PRI_USER_MAX)
 }
 
+// ---- "creating flux": redstone compressed between bedrock (or a flux block) and obsidian ------
+
+/// `FluxConfig.enableFluxRecipe`'s default (`true`). The pack's config is not ported, so the
+/// mechanic is always on, which is what the default gives a player.
+pub const CREATION_ENABLED: bool = true;
+
+/// `EventHandler.onPlayerInteract` stops collecting redstone at `itemCount >= 512`, so one
+/// operation consumes at most this many and leaves the rest of the pile where it lies.
+pub const CREATION_CAP: i32 = 512;
+
+/// The block two below the click: upstream accepts bedrock or the mod's own flux block, so a
+/// player can build the press anywhere once they have a flux block.
+pub fn creation_base_ok(block: &str) -> bool {
+    matches!(block, "minecraft:bedrock" | "fluxnetworks:flux_block")
+}
+
+/// The clicked block upstream calls the crusher: obsidian, and nothing else.
+pub fn is_crusher(block: &str) -> bool {
+    block == "minecraft:obsidian"
+}
+
+/// `new ItemStack(FLUX_DUST, itemCount)`: one dust per redstone taken, capped at
+/// [`CREATION_CAP`]; a pile of nothing makes nothing.
+pub fn created_dust(redstone: i32) -> i32 {
+    redstone.clamp(0, CREATION_CAP)
+}
+
+/// What the block below the obsidian becomes after one operation.
+///
+/// Upstream removes the obsidian and then sets the gap to one of two blocks: the obsidian has
+/// "slid down" one, or the press collapses to cobblestone, which is what makes the recipe
+/// consume obsidian at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapAfter {
+    /// `Blocks.COBBLESTONE`: the obsidian is spent.
+    Cobblestone,
+    /// The obsidian itself, one block lower.
+    Obsidian,
+}
+
+/// `level.getRandom().nextDouble() > Math.pow(0.9, itemCount >> 3)`: cobblestone, else the
+/// obsidian. The exponent is the batch in units of eight, so a big batch collapses the press
+/// almost every time and a batch of one to seven does so one time in ten.
+pub fn gap_after(dust: i32, roll: f64) -> GapAfter {
+    let exponent = created_dust(dust) >> 3;
+    if roll > 0.9_f64.powi(exponent) {
+        GapAfter::Cobblestone
+    } else {
+        GapAfter::Obsidian
+    }
+}
+
+/// `Mth.clamp(itemCount >> 2, 4, 64)` lava particles at the click.
+pub fn creation_particles(dust: i32) -> i32 {
+    (created_dust(dust) >> 2).clamp(4, 64)
+}
+
 /// `TransferHandler.setLimit`: never negative, never above the buffer.
 pub fn clamp_limit(limit: i32, capacity: i32) -> i32 {
     limit.clamp(0, capacity)
@@ -606,6 +663,73 @@ mod tests {
         let devices = [plug(0), full, point(0)];
         assert!(plan_cycle(&devices).is_empty());
         assert_eq!(pull_cap(DEFAULT_LIMIT, 0), 0);
+    }
+
+    // ---- slice 2: "creating flux" (upstream's `EventHandler.onPlayerInteract`) --------------
+
+    /// The mechanic's site: an obsidian block with a bedrock or flux-block base two below it.
+    #[test]
+    fn the_creation_base_is_bedrock_or_a_flux_block() {
+        assert!(creation_base_ok("minecraft:bedrock"), "bedrock is the base");
+        assert!(
+            creation_base_ok("fluxnetworks:flux_block"),
+            "a flux block is the other base"
+        );
+        assert!(!creation_base_ok("minecraft:stone"), "stone is not a base");
+        assert!(!creation_base_ok("minecraft:obsidian"), "obsidian is not");
+        assert!(!creation_base_ok("minecraft:cobblestone"), "cobble is not");
+    }
+
+    #[test]
+    fn the_crusher_is_obsidian() {
+        assert!(is_crusher("minecraft:obsidian"));
+        assert!(!is_crusher("minecraft:bedrock"));
+        assert!(!is_crusher("fluxnetworks:flux_block"));
+    }
+
+    /// One dust per redstone, and at most 512 in one operation: upstream breaks its
+    /// collection loop at `itemCount >= 512`.
+    #[test]
+    fn one_dust_per_redstone_up_to_the_512_cap() {
+        assert_eq!(created_dust(0), 0, "no redstone, no dust");
+        assert_eq!(created_dust(-3), 0, "a negative count is nothing");
+        assert_eq!(created_dust(1), 1);
+        assert_eq!(created_dust(8), 8);
+        assert_eq!(created_dust(CREATION_CAP), CREATION_CAP);
+        assert_eq!(
+            created_dust(520),
+            CREATION_CAP,
+            "the 513th redstone is left"
+        );
+        assert_eq!(created_dust(100_000), CREATION_CAP);
+    }
+
+    /// `level.getRandom().nextDouble() > Math.pow(0.9, itemCount >> 3)`: a bigger batch
+    /// turns the gap to cobblestone more often, because the exponent grows with the batch.
+    #[test]
+    fn a_bigger_batch_turns_the_gap_to_cobblestone_more_often() {
+        // 8 redstone: the exponent is 1, so the threshold is 0.9.
+        assert_eq!(gap_after(8, 0.95), GapAfter::Cobblestone);
+        assert_eq!(gap_after(8, 0.5), GapAfter::Obsidian);
+        // 512 redstone: the exponent is 64, so the threshold is ~0.0012 and the same roll
+        // makes cobblestone.
+        assert_eq!(gap_after(512, 0.5), GapAfter::Cobblestone);
+        // Without dust nothing is made; the roll is not the reason.
+        assert_eq!(gap_after(0, 0.0), GapAfter::Obsidian);
+    }
+
+    /// `Mth.clamp(itemCount >> 2, 4, 64)` lava particles.
+    #[test]
+    fn the_creation_particles_clamp_between_four_and_sixty_four() {
+        assert_eq!(creation_particles(0), 4);
+        assert_eq!(creation_particles(8), 4, "8 >> 2 = 2, clamped up to 4");
+        assert_eq!(creation_particles(64), 16);
+        assert_eq!(creation_particles(CREATION_CAP), 64);
+        assert_eq!(
+            creation_particles(100_000),
+            64,
+            "the cap holds the particles too"
+        );
     }
 
     #[test]

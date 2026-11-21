@@ -213,3 +213,49 @@ approval (ARCHITECTURE.md §8).
 - `python3 tools/test_template.py` is the template's own fixture test (it
   asserts `injections == 1` on a fake workspace with no `native-hooks.json`);
   it cannot pass for a real bundle and is not part of this ladder.
+
+# Slice 2 — creating flux and the seven carried recipes (0.2.2, pin `0a875da`)
+
+Current: package **0.2.2** at Horizon `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` + mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, launcher **0.2.92**, Nightly
+`nightly-2026-11-20-0a875da`, for 26.3. The ladder and the in-game transcript are recorded in
+[`notes.md`](notes.md) under `## Slice 2 — creating flux`; this file indexes the commands.
+
+Every step ran through `ports/tools/build-slot.sh` (`BUILD_LOCAL=1` — the far box has no copy of
+the port), `CARGO_INCREMENTAL=0`, no `--target-dir`, no private `BUILD_SLOTS_DIR`. The package
+steps are per-step leases (`stage`/`test`/`lint`/`fmt`/`build`/`check`); the game legs are
+`--step e2e`.
+
+| Step | Command | Result | Evidence |
+|---|---|---|---|
+| unit tests | `cargo test --offline` | 37 passed, 0 failed | `evidence/fluxnetworks/sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, 0 warnings | `sdk-clippy.log` |
+| format | `cargo fmt --check` | clean | `sdk-fmt.log` |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` | 133,581 B, built twice, `cmp` identical | `sdk-build.log`, `sdk-build-second.log` |
+| registry check | `cargo horizon-mod check fluxnetworks.hmod` | exit 0 | `sdk-check.log` |
+| fits (the pin) | `cargo horizon-mod fits … --build 0a875da` | `0a875da  made for`, exit 0 | `sdk-fits.log` |
+| fits (a different build) | `cargo horizon-mod fits … --build 0b14f8a` | `0b14f8a  fits`, exit 0 | `sdk-fits.log` |
+| package gate | `python3 ports/tools/verify-sdk-package.py fluxnetworks` | 1/1 | this session |
+
+The game was built and launched by `ports/tools/launcher-game.sh` with
+`HORIZON_E2E_INSTANCE=fluxnetworks-e2e` (a fresh instance on the new Nightly; the shared `e2e`
+instance is bound to a `0b14f8a` build, and `native-build` reuses the instance's base version):
+
+```sh
+HORIZON_E2E_INSTANCE=fluxnetworks-e2e ports/tools/launcher-game.sh build fluxnetworks
+eval "$(HORIZON_E2E_INSTANCE=fluxnetworks-e2e ports/tools/launcher-game.sh env fluxnetworks)"
+BUILD_LOCAL=1 ports/tools/build-slot.sh run --job W1-fluxnetworks --port ports/fluxnetworks \
+    --step e2e -- bash ports/fluxnetworks/tools/e2e.sh
+```
+
+| Leg | Result | Log |
+|---|---|---|
+| the package | `PASS` + `EXIT:0` | `evidence/fluxnetworks-e2e/e2e-launcher.log` |
+| the same Nightly, **no package** (`GAME=$CONTROL_GAME`) | `FAIL: the redstone was not consumed (8 left)` + `EXIT:1` | `…-control.log` |
+| `SELFTEST=1` | `FAIL: SELFTEST flipped: the redstone survived a stone base, as it should` + `EXIT:1` | `…-selftest.log` |
+| log gate | `python3 ports/tools/check-e2e-logs.py fluxnetworks-e2e --strict` | `logs=4 ok=4` | — |
+
+The leg launches `--offscreen` (not `--headless`): `click-slot`, which the crafting phase needs,
+requires a renderer.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review
